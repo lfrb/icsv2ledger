@@ -222,6 +222,12 @@ def parse_args_and_config_file():
             for item in config.items(args.account + '_addons'):
                 if item not in config.defaults().items():
                     defaults['addons']['addon_' + item[0]] = int(item[1])
+
+        defaults['mappings'] = {}
+        if config.has_section(args.account + '_mappings'):
+            for item in config.items(args.account + '_mappings'):
+                if item not in config.defaults().items():
+                    defaults['mappings']['mapping_' + item[0]] = int(item[1])
     else:
         # no config file found
         defaults = DEFAULTS
@@ -465,6 +471,12 @@ class Entry:
                                for k, v in options.addons.items())
         else:
             self.addons = dict()
+
+        if 'mappings' in options:
+            self.mappings = dict((k, find_first_file(v, []))
+                               for k, v in options.mappings.items())
+        else:
+            self.mappings = dict()
 
         # Get the date and convert it into a ledger formatted date.
         self.date = fields[options.date - 1]
@@ -813,6 +825,10 @@ def main():
     mappings = []
     if options.mapping_file:
         mappings = read_mapping_file(options.mapping_file)
+
+    field_mappings = {}
+    for field, mapping_file in self.mappings.items():
+        field_mappings[field] = read_mapping_file(mapping_file)
 
     if options.accounts_file:
         possible_accounts.update(read_accounts_file(options.accounts_file))
