@@ -590,9 +590,10 @@ class Entry:
             'csv': self.raw_csv}
         format_data.update(self.addons)
 
-        # generate and clean output
+        # generate and clean output by removing invalid lines (tag without value or empty line)
         output_lines = template.format(**format_data).split('\n')
-        output = '\n'.join([x.rstrip() for x in output_lines if x.strip()]) + '\n'
+        invalid_line = re.compile(r"^(\s*[;#]\s*\w+:+)?\s*$")
+        output = '\n'.join([x.rstrip() for x in output_lines if not invalid_line.match(x)]) + '\n'
 
         return output
 
@@ -908,7 +909,7 @@ def main():
         Process them.
         Write Ledger lines either to filename or stdout.
         """
-        if not options.incremental:
+        if not options.incremental and out_file is not sys.stdout:
             out_file.truncate(0)
 
         csv_lines = get_csv_lines(in_file)
