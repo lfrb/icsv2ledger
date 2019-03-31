@@ -6,6 +6,7 @@
 # Requires Python >= 3.2 and Ledger >= 3.0
 
 import argparse
+import copy
 import csv
 import io
 import glob
@@ -20,6 +21,8 @@ from argparse import HelpFormatter
 from datetime import datetime
 from operator import attrgetter
 from locale   import atof
+
+# TODO mapping files are weird
 
 
 class FileType(object):
@@ -83,21 +86,28 @@ def get_locale_currency_symbol():
 DEFAULTS = dotdict({
     # For configparser, int must be converted to str
     # For configparser, boolean must be set to False
+    'account_id': '',
     'account': 'Assets:Bank:Current',
-    'src_account': '',
+    'addons': {},
+    'mappings': {},
+    'extra_keys': {},
     'clear_screen': False,
     'cleared_character': '*',
     'credit': str(4),
     'csv_date_format': '',
     'currency': get_locale_currency_symbol(),
+    'subaccount': str(0),
     'date': str(1),
     'effective_date': str(0),
+    'code': str(0),
     'debit': str(3),
     'default_expense': 'Expenses:Unknown',
     'desc': str(2),
     'encoding': 'utf-8',
     'ledger_date_format': '',
     'quiet': False,
+    'balance': str(0),
+    'check': False,
     'reverse': False,
     'skip_lines': str(1),
     'skip_dupes': False,
@@ -110,6 +120,7 @@ DEFAULTS = dotdict({
     'ledger_decimal_comma': False,
     'skip_older_than': str(-1),
     'prompt_add_mappings': False,
+    'skip_add_mappings': False,
     'entry_review': False})
 
 FILE_DEFAULTS = dotdict({
@@ -119,18 +130,21 @@ FILE_DEFAULTS = dotdict({
     'ledger_file': [
         os.path.join('.', '.ledger'),
         os.path.join(os.path.expanduser('~'), '.ledger')],
-    'mapping_file': [
+    'mapping_files': [
         os.path.join('.', '.icsv2ledgerrc-mapping'),
         os.path.join(os.path.expanduser('~'), '.icsv2ledgerrc-mapping')],
     'accounts_file': [
         os.path.join('.', '.icsv2ledgerrc-accounts'),
         os.path.join(os.path.expanduser('~'), '.icsv2ledgerrc-accounts')],
+    'header_file': [
+        os.path.join('.', '.icsv2ledgerrc-header'),
+        os.path.join(os.path.expanduser('~'), '.icsv2ledgerrc-header')],
     'template_file': [
         os.path.join('.', '.icsv2ledgerrc-template'),
         os.path.join(os.path.expanduser('~'), '.icsv2ledgerrc-template')]})
 
 DEFAULT_TEMPLATE = """\
-{date} {cleared_character} {payee}
+{date} {cleared_character}{code} {payee}
     ; MD5Sum: {md5sum}
     ; CSV: {csv}
     {debit_account:<60}    {debit_currency} {debit}
@@ -139,18 +153,29 @@ DEFAULT_TEMPLATE = """\
 """
 
 
-def find_first_file(arg_file, alternatives):
+def find_first_files(arg_files, alternatives):
     """Because of http://stackoverflow.com/questions/12397681,
     parser.add_argument(type= or action=) on a file can not be used
     """
-    found = None
-    file_locs = [arg_file] + alternatives
-    for loc in file_locs:
+    found = []
+    ls = arg_files.split(',') if arg_files else []
+    for loc in ls:
         if loc is not None and os.access(loc, os.F_OK | os.R_OK):
-            found = loc  # existing and readable
-            break
-    return found
+            found.append(loc)  # existing and readable
+    if found:
+        return found
 
+    for loc in alternatives:
+        if loc is not None and os.access(loc, os.F_OK | os.R_OK):
+            return [loc]  # existing and readable
+
+    return []
+
+def find_first_file(arg_file, alternatives):
+    try:
+        return find_first_files(arg_file, alternatives)[0]
+    except:
+        return None
 
 class SortingHelpFormatter(HelpFormatter):
     """Sort options alphabetically when -h prints usage
@@ -183,10 +208,10 @@ def parse_args_and_config_file():
         # Turn off help in first parser because all options are not present
         add_help=False)
     preparser.add_argument(
-        '--account', '-a',
+        '--account-id', '-a',
         metavar='STR',
         help=('ledger account used as source'
-              ' (default: {0})'.format(DEFAULTS.account)))
+              ' (default: {0})'.format(DEFAULTS.account_id)))
     preparser.add_argument(
         '--config-file', '-c',
         metavar='FILE',
@@ -199,35 +224,54 @@ def parse_args_and_config_file():
     args.config_file = find_first_file(args.config_file,
                                        FILE_DEFAULTS.config_file)
 
+    def parse_options(section, defaults, depth=0):
+        config = configparser.RawConfigParser(defaults)
+        config.read(args.config_file)
+        if not config.has_section(section):
+            print('Config file {0} does not contain section {1}'
+                  .format(args.config_file, section),
+                  file=sys.stderr)
+            sys.exit(1)
+        options = dict(config.items(section))
+        
+        if options['account_id']:
+            print('Section {0} in config file {1} contains command line only option account_id'
+                  .format(section, args.config_file),
+                  file=sys.stderr)
+            sys.exit(1)
+
+        options['addons'] = {}
+        if config.has_section(section + '_addons'):
+            for item in config.items(section + '_addons'):
+                if item not in config.defaults().items():
+                    options['addons'][item[0]] = int(item[1])
+
+        options['mappings'] = {}
+        if config.has_section(section + '_mappings'):
+            for item in config.items(section + '_mappings'):
+                options['mappings'][item[0]] = item[1]
+
+        options['extra_keys'] = {}
+        for k,v in config.items(section):
+            if k not in DEFAULTS and k not in FILE_DEFAULTS:
+                options['extra_keys'][k] = eval(v)
+
+        sub_options = {}
+        if depth == 0:
+            prefix = "{}-".format(args.account_id)
+            for section in config.sections():
+                if section.startswith(prefix):
+                    nested_options = parse_options(section, options, depth + 1)
+                    sub_options[section.replace(prefix, '')], x = nested_options
+
+        return options, sub_options
+
+    subaccounts = []
+    sub_defaults = {}
     # Initialize configparser with DEFAULTS, and then read config file
     if args.config_file and ('-h' not in remaining_argv and
                              '--help' not in remaining_argv):
-        config = configparser.RawConfigParser(DEFAULTS)
-        config.read(args.config_file)
-        if not config.has_section(args.account):
-            print('Config file {0} does not contain section {1}'
-                  .format(args.config_file, args.account),
-                  file=sys.stderr)
-            sys.exit(1)
-        defaults = dict(config.items(args.account))
-        
-        if defaults['src_account']:
-            print('Section {0} in config file {1} contains command line only option src_account'
-                  .format(args.account, args.config_file),
-                  file=sys.stderr)
-            sys.exit(1)
-            
-        defaults['addons'] = {}
-        if config.has_section(args.account + '_addons'):
-            for item in config.items(args.account + '_addons'):
-                if item not in config.defaults().items():
-                    defaults['addons']['addon_' + item[0]] = int(item[1])
-
-        defaults['mappings'] = {}
-        if config.has_section(args.account + '_mappings'):
-            for item in config.items(args.account + '_mappings'):
-                if item not in config.defaults().items():
-                    defaults['mappings']['mapping_' + item[0]] = int(item[1])
+        defaults, sub_defaults = parse_options(args.account_id, DEFAULTS)
     else:
         # no config file found
         defaults = DEFAULTS
@@ -241,7 +285,6 @@ def parse_args_and_config_file():
         description=__doc__,
         # sort options alphabetically
         formatter_class=SortingHelpFormatter)
-    parser.set_defaults(**defaults)
 
     parser.add_argument(
         'infile',
@@ -275,10 +318,10 @@ def parse_args_and_config_file():
         help=('do not prompt if account can be deduced'
               ' (default: {0})'.format(DEFAULTS.quiet)))
     parser.add_argument(
-        '--src-account',
+        '--account',
         metavar='STR',
-        help=('ledger source account to use, overrides --account option specified in config section'
-              ' (default: {0})'.format(DEFAULTS.src_account)))
+        help=('ledger source account to use'
+              ' (default: {0})'.format(DEFAULTS.account)))
     parser.add_argument(
         '--default-expense',
         metavar='STR',
@@ -328,6 +371,11 @@ def parse_args_and_config_file():
         help=('CSV column number matching effective date'
               ' (default: {0})'.format(DEFAULTS.effective_date)))
     parser.add_argument(
+        '--code',
+        metavar='INT',
+        help=('CSV column number matching code'
+              ' (default: {0})'.format(DEFAULTS.code)))
+    parser.add_argument(
         '--desc',
         metavar='STR',
         help=('CSV column number matching description'
@@ -344,6 +392,17 @@ def parse_args_and_config_file():
         type=int,
         help=('CSV column number matching credit amount'
               ' (default: {0})'.format(DEFAULTS.credit)))
+    parser.add_argument(
+        '--balance',
+        metavar='INT',
+        type=int,
+        help=('CSV column number matching balance amount'
+              ' (default: {0})'.format(DEFAULTS.balance)))
+    parser.add_argument(
+        '--check',
+        action='store_true',
+        help=('add a balance check at the end of the ledger'
+              ' (default: {0})'.format(DEFAULTS.check)))
     parser.add_argument(
         '--csv-date-format',
         metavar='STR',
@@ -376,15 +435,21 @@ def parse_args_and_config_file():
               ' (default search order: {0})'
               .format(', '.join(FILE_DEFAULTS.accounts_file))))
     parser.add_argument(
-        '--mapping-file',
+        '--mapping-files',
         metavar='FILE',
-        help=('file which holds the mappings'
+        help=('files which holds the mappings'
               ' (default search order: {0})'
-              .format(', '.join(FILE_DEFAULTS.mapping_file))))
+              .format(', '.join(FILE_DEFAULTS.mapping_files))))
+    parser.add_argument(
+        '--header-file',
+        metavar='FILE',
+        help=('file which holds the header template'
+              ' (default search order: {0})'
+              .format(', '.join(FILE_DEFAULTS.header_file))))
     parser.add_argument(
         '--template-file',
         metavar='FILE',
-        help=('file which holds the template'
+        help=('file which holds the transaction template'
               ' (default search order: {0})'
               .format(', '.join(FILE_DEFAULTS.template_file))))
     parser.add_argument(
@@ -423,21 +488,42 @@ def parse_args_and_config_file():
               ' (default: {0})'.format(DEFAULTS.prompt_add_mappings)))
 
     parser.add_argument(
+        '--skip-add-mappings',
+        action='store_true',
+        help=('skip adding entries to mapping file'
+              ' (default: {0})'.format(DEFAULTS.skip_add_mappings)))
+
+    parser.add_argument(
         '--entry-review',
         action='store_true',
         help=('displays transaction summary and request confirmation before committing to ledger'
               ' (default: {0})'.format(DEFAULTS.entry_review)))
 
-    args = parser.parse_args(remaining_argv)
+    def parse_args(default_values):
+        parser.set_defaults(**default_values)
+        args = parser.parse_args(remaining_argv)
+
+        args.template_file = find_first_file(
+            args.template_file, FILE_DEFAULTS.template_file)
+
+        return args
+
+    defaults['config_file'] = args.config_file
+    defaults['account_id'] = args.account_id
+
+    args = parse_args(defaults)
+    sub_args = {}
+    for sub_id, values in sub_defaults.items():
+        sub_args[sub_id] = parse_args(values)
 
     args.ledger_file = find_first_file(
         args.ledger_file, FILE_DEFAULTS.ledger_file)
-    args.mapping_file = find_first_file(
-        args.mapping_file, FILE_DEFAULTS.mapping_file)
+    args.mapping_files = find_first_files(
+        args.mapping_files, FILE_DEFAULTS.mapping_files)
     args.accounts_file = find_first_file(
         args.accounts_file, FILE_DEFAULTS.accounts_file)
-    args.template_file = find_first_file(
-        args.template_file, FILE_DEFAULTS.template_file)
+    args.header_file = find_first_file(
+        args.header_file, FILE_DEFAULTS.header_file)
 
     if args.ledger_date_format and not args.csv_date_format:
         print('csv_date_format must be set'
@@ -449,75 +535,128 @@ def parse_args_and_config_file():
         args.infile = io.TextIOWrapper(args.infile.detach(),
                                        encoding=args.encoding)
 
-    return args
+    return args, sub_args
 
+class Money:
+    def __init__(self, value, options):
+        self.options = options
+        if options.csv_decimal_comma:
+            value = value.replace(',', '.')
+        re_non_number = '[^-0-9.]'
+        # Add negative symbol to raw_value if between parentheses
+        # E.g.  ($13.37) becomes -$13.37
+        if value.startswith("(") and value.endswith(")"):
+            value = "-" + value[1:-1]
+
+        value = re.sub(re_non_number, '', value)
+        #self.amount = Decimal(value)
+        self.value = value
+
+    def __bool__(self):
+        return bool(self.value)
+
+    def __float__(self):
+        return float(self.value)
+
+    def __str__(self):
+        if self.options.ledger_decimal_comma:
+            return self.value.replace('.', ',')
+        return self.value
+
+class Date:
+    def __init__(self, value, options):
+        self.options = options
+        self.value = value
+        if options.csv_date_format and value:
+            self.date = datetime.strptime(value, options.csv_date_format)
+        else:
+            self.date = None
+
+    def __bool__(self):
+        return bool(self.value)
+        
+    def __str__(self):
+        if self.options.ledger_date_format:
+            return self.date.strftime(self.options.ledger_date_format)
+        return self.value
+
+class Tag:
+    def __init__(self, value, options):
+        self.value = value
+
+    def __bool__(self):
+        return bool(self.value)
+
+    def __str__(self):
+        return self.value
+
+class Field:
+    def __init__(self, col, label, cast, mapping_file=None):
+        self.column = col
+        self.label = label
+        self.cast = cast
+        self.mapping_file = mapping_file
+
+class Variable:
+    def __init__(self, value):
+        self.value = value
 
 class Entry:
     """
     This represents one entry in the CSV file.
     """
 
-    def __init__(self, fields, raw_csv, options):
+    def __init__(self, fields, raw_csv, options, sub_options):
         """Parameters:
         fields: list of fields read from one line of the CSV file
         raw_csv: unprocessed line from CSV file
         options: from CLI args and config file
         """
 
+        # Check if the entry is associated with a sub-account
+        self.subaccount = ""
+        if options.subaccount and int(options.subaccount) != 0:
+            self.subaccount = fields[int(options.subaccount) - 1].strip()
+            if self.subaccount not in sub_options:
+                print('Config file {0} does not contain section {1}'
+                        .format(options.config_file, section_name),
+                        file=sys.stderr)
+                sys.exit(1)
+            options = sub_options[self.subaccount]
+
         self.options = options
 
-        if 'addons' in options:
+        if 'addons' in self.options:
             self.addons = dict((k, fields[v - 1])
-                               for k, v in options.addons.items())
+                               for k, v in self.options.addons.items())
         else:
             self.addons = dict()
 
-        if 'mappings' in options:
-            self.mappings = dict((k, find_first_file(v, []))
-                               for k, v in options.mappings.items())
-        else:
-            self.mappings = dict()
+        for k, v in self.options.extra_keys.items():
+            if type(v) is Field:
+                self.addons[k] = v.cast(get_field_at_index(fields, v.column), options)
+            elif type(v) is Variable:
+                self.addons[k] = v.value
 
         # Get the date and convert it into a ledger formatted date.
-        self.date = fields[options.date - 1]
-        entry_date = datetime.strptime(self.date, options.csv_date_format)
-        if options.ledger_date_format:
-            if options.ledger_date_format != options.csv_date_format:
-                self.date = (datetime
-                             .strptime(self.date, options.csv_date_format)
-                             .strftime(options.ledger_date_format))
+        self.date = Date(get_field_at_index(fields, options.date), options)
+        self.effective_date = Date(get_field_at_index(fields, options.effective_date), options)
 
         # determine how many days old this entry is
-        self.days_old = (datetime.now()-entry_date).days
-
-        # convert effective dates
-        if options.effective_date:
-            self.effective_date = fields[options.effective_date - 1]
-            if options.ledger_date_format:
-                if options.ledger_date_format != options.csv_date_format:
-                    self.effective_date = (datetime
-                                 .strptime(self.effective_date, options.csv_date_format)
-                                 .strftime(options.ledger_date_format))
-        else:
-            self.effective_date = ""
-
+        # XXX what if CSV date format is not specified
+        self.days_old = (datetime.now() - self.date.date).days
 
         desc = []
-        for index in re.compile(',\s*').split(options.desc):
+        for index in re.compile(',\s*').split(self.options.desc):
             desc.append(fields[int(index) - 1].strip())
         self.desc = ' '.join(desc).strip()
 
-        self.credit = get_field_at_index(fields, options.credit, options.csv_decimal_comma, options.ledger_decimal_comma)
-        self.debit = get_field_at_index(fields, options.debit, options.csv_decimal_comma, options.ledger_decimal_comma)
-        if self.credit  and self.debit and atof(self.credit) == 0:
-            self.credit = ''
-        elif self.credit and self.debit and atof(self.debit) == 0:
-            self.debit  = ''
+        self.code = get_field_at_index(fields, options.code)
+        self.credit = Money(get_field_at_index(fields, options.credit), options)
+        self.debit = Money(get_field_at_index(fields, options.debit), options)
+        self.balance = Money(get_field_at_index(fields, options.balance), options)
 
         self.credit_account = options.account
-        if options.src_account:
-            self.credit_account = options.src_account
-        
         self.currency = options.currency
         self.credit_currency = getattr(
             options, 'credit_currency', self.currency)
@@ -533,17 +672,18 @@ class Entry:
 
         # We also record this - in future we may use it to avoid duplication
         #self.md5sum = hashlib.md5(self.raw_csv.encode('utf-8')).hexdigest()
-        self.md5sum = hashlib.md5(','.join(x.strip() for x in (self.date,self.desc,self.credit,self.debit,self.credit_account)).encode('utf-8')).hexdigest()
+        self.md5sum = hashlib.md5(','.join(str(x).strip() for x in (self.date,self.desc,self.credit,self.debit,self.credit_account)).encode('utf-8')).hexdigest()
 
     def prompt(self):
         """
         We print a summary of the record on the screen, and allow you to
         choose the destination account.
         """
-        return '{0} {1:<40} {2}'.format(
+        return '{0} {1:<40} {2}{3}'.format(
             self.date,
             self.desc,
-            self.credit if self.credit else "-" + self.debit)
+            "-" if self.debit else "",
+            self.credit if self.credit else self.debit)
 
     def journal_entry(self, transaction_index, payee, account, tags):
         """
@@ -567,11 +707,12 @@ class Entry:
             tags = '; ' + tags_separator.join(tags).replace('::', ':')
         else:
             tags = ''
-        
+
         format_data = {
             'date': self.date,
             'effective_date': self.effective_date,
             'cleared_character': self.cleared_character,
+            'code': " ({})".format(self.code) if self.code else "",
             'payee': payee,
             'transaction_index': transaction_index,
 
@@ -579,11 +720,14 @@ class Entry:
 
             'debit_account': account,
             'debit_currency': self.currency if self.debit else "",
-            'debit': self.debit,
+            'debit': self.debit if self.debit and float(self.debit) != 0 else "",
 
             'credit_account': self.credit_account,
             'credit_currency': self.credit_currency if self.credit else "",
-            'credit': self.credit,
+            'credit': self.credit if self.credit and float(self.credit) != 0 else "",
+
+            'balance_currency': self.currency if self.balance else "",
+            'balance': self.balance,
 
             'tags': tags,
             'md5sum': self.md5sum,
@@ -597,30 +741,17 @@ class Entry:
 
         return output
 
-def get_field_at_index(fields, index, csv_decimal_comma, ledger_decimal_comma):
+def get_field_at_index(fields, index):
     """
     Get the field at the given index.
     If the index is less than 0, then we invert the sign of
     the field at the given index
     """
+    index = int(index)
     if index == 0 or index > len(fields):
         return ""
-
-    if csv_decimal_comma:
-        decimal_separator = ','
-    else:
-        decimal_separator = '.'
-
-    re_non_number = '[^-0-9' + decimal_separator + ']'
-
-    raw_value = fields[abs(index) - 1]
-    # Add negative symbol to raw_value if between parentheses
-    # E.g.  ($13.37) becomes -$13.37
-    if raw_value.startswith("(") and raw_value.endswith(")"):
-        raw_value = "-" + raw_value[1:-1]
-
-    value = re.sub(re_non_number, '', raw_value)
-    # Invert sign of value if index is negative.
+        # Invert sign of value if index is negative.
+    value = fields[abs(index) - 1].strip()
     if index < 0:
         if value.startswith("-"):
             value = value[1:]
@@ -628,14 +759,7 @@ def get_field_at_index(fields, index, csv_decimal_comma, ledger_decimal_comma):
             value = ""
         else:
             value = "-" + value
-
-    if csv_decimal_comma and not ledger_decimal_comma:
-        value = value.replace(',', '.')
-    if not csv_decimal_comma and ledger_decimal_comma:
-        value = value.replace('.', ',')
-
     return value
-
 
 def csv_md5sum_from_ledger(ledger_file):
     with open(ledger_file) as f:
@@ -684,7 +808,7 @@ def from_ledger(ledger_file, command):
     return items
 
 
-def read_mapping_file(map_file):
+def read_mapping_files(map_files):
     """
     Mappings are simply a CSV file with three columns.
     The first is a string to be matched against an entry description.
@@ -695,25 +819,26 @@ def read_mapping_file(map_file):
     regular expression.
     """
     mappings = []
-    with open(map_file, "r", encoding='utf-8', newline='') as f:
-        map_reader = csv.reader(f)
-        for row in map_reader:
-            if len(row) > 1:
-                pattern = row[0].strip()
-                payee = row[1].strip()
-                account = row[2].strip()
-                tags = row[3:]
-                if pattern.startswith('/') and pattern.endswith('/'):
-                    try:
-                        pattern = re.compile(pattern[1:-1])
-                    except re.error as e:
-                        print("Invalid regex '{0}' in '{1}': {2}"
-                              .format(pattern, map_file, e),
-                              file=sys.stderr)
-                        sys.exit(1)
-                mappings.append((pattern, payee, account, tags))
+    for map_file in map_files:
+        with open(map_file, "r", encoding='utf-8', newline='') as f:
+            map_reader = csv.reader(f)
+            for row in map_reader:
+                if len(row) > 1:
+                    pattern = row[0].strip()
+                    fields = [field.strip() for field in row[1:]]
+                    if pattern.startswith('/') and pattern.endswith('/'):
+                        try:
+                            pattern = re.compile(pattern[1:-1])
+                        except re.error as e:
+                            print("Invalid regex '{0}' in '{1}': {2}"
+                                  .format(pattern, map_file, e),
+                                  file=sys.stderr)
+                            sys.exit(1)
+                    mappings.append((pattern, *fields))
     return mappings
 
+def read_mapping_file(map_file):
+    return read_mapping_files([map_file])
 
 def read_accounts_file(account_file):
     """ Process each line in the specified account file looking for account
@@ -736,11 +861,11 @@ def read_accounts_file(account_file):
     return accounts
 
 
-def append_mapping_file(map_file, desc, payee, account, tags):
+def append_mapping_file(map_file, *fields):
     if map_file:
         with open(map_file, 'a', encoding='utf-8', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([desc, payee, account] + tags)
+            writer.writerow(fields)
 
 
 def tagify(value):
@@ -749,20 +874,20 @@ def tagify(value):
     return value
 
 
-def prompt_for_tags(prompt, values, default):
-    tags = list(default)
-    value = prompt_for_value(prompt, values, ", ".join(tags))
+def prompt_for_multiple_values(prompt, possible_values, default):
+    values = list(default)
+    value = prompt_for_value(prompt, possible_values, ", ".join(values))
     while value:
         if value[0] == '-':
             value = tagify(value[1:])
-            if value in tags:
-                tags.remove(value)
+            if value in values:
+                values.remove(value)
         else:
             value = tagify(value)
-            if not value in tags:
-                tags.append(value)
-        value = prompt_for_value(prompt, values, ", ".join(tags))
-    return tags
+            if not value in values:
+                values.append(value)
+        value = prompt_for_value(prompt, possible_values, ", ".join(values))
+    return values
 
 
 def prompt_for_value(prompt, values, default):
@@ -804,10 +929,71 @@ def reset_stdin():
               file=sys.stderr)
         sys.exit(1)
 
+def find_mapping(options, instr, mapping_files, mappings, fields):
+    outfields = [x['default'] for x in fields if not x['remaining']]
+    found = False
+
+    # Try to match string with mappings patterns
+    for m in mappings:
+        pattern = m[0]
+        if isinstance(pattern, str):
+            if instr == pattern:
+                outfields = list(m[1:])
+                found = True  # do not break here, later mapping must win
+        else:
+            # If the pattern isn't a string it's a regex
+            match = m[0].match(instr)
+            if match:
+                # perform regexp substitution if captures were used
+                if match.groups():
+                    outfields = [m[0].sub(f, instr) for f in m[1:]]
+                else:
+                    outfields = m[1:]
+                found = True
+
+    modified = False
+    if options.quiet and found:
+        pass
+    else:
+        for i, f in enumerate(fields):
+            if not f['prompt']:
+                continue
+            if f['remaining']:
+                old_value = outfields[i:]
+                value = prompt_for_multiple_values(f['label'], f['possible_values'], old_value)
+            else:
+                old_value = outfields[i]
+                value = prompt_for_value(f['label'], f['possible_values'], old_value)
+            if value:
+                modified = modified if modified else value != old_value
+                outfields[i] = value
+
+    if mapping_files and (not found or (found and modified)):
+        value = 'Y'
+        # if prompt-add-mappings option passed then request confirmation before adding to mapping file
+        if options.skip_add_mappings:
+            value = 'N'
+        elif options.prompt_add_mappings:
+            yn_response = prompt_for_value('Append to mapping file?', possible_yesno, 'Y')
+            if yn_response:
+                value = yn_response
+        if value.upper().strip() not in ('N','NO'):
+            # Add new or changed mapping to mappings and append to file
+            mappings.append(tuple([instr] + outfields))
+            append_mapping_file(mapping_files[-1], instr, *outfields)
+
+        # Add new possible_values to possible values lists
+        for i, field in enumerate(fields):
+            if field['remaining']:
+                field['possible_values'].update(set(outfields[i:]))
+            else:
+                field['possible_values'].add(outfields[i])
+
+    return outfields
 
 def main():
 
-    options = parse_args_and_config_file()
+    options, sub_options = parse_args_and_config_file()
     # Define responses to yes/no prompts
     possible_yesno =  set(['Y','N'])
 
@@ -824,12 +1010,15 @@ def main():
 
     # Read mappings
     mappings = []
-    if options.mapping_file:
-        mappings = read_mapping_file(options.mapping_file)
+    if options.mapping_files:
+        mappings = read_mapping_files(options.mapping_files)
 
     field_mappings = {}
-    for field, mapping_file in self.mappings.items():
+    for field, mapping_file in options.mappings.items():
         field_mappings[field] = read_mapping_file(mapping_file)
+    for k, v in options.extra_keys.items():
+        if type(v) is Field and v.mapping_file:
+            field_mappings[k] = read_mapping_file(v.mapping_file)
 
     if options.accounts_file:
         possible_accounts.update(read_accounts_file(options.accounts_file))
@@ -838,71 +1027,25 @@ def main():
     for m in mappings:
         possible_payees.add(m[1])
         possible_accounts.add(m[2])
-        possible_tags.update(set(m[3]))
+        possible_tags.update(set(m[3:]))
 
     def get_payee_and_account(entry):
-        payee = entry.desc
-        account = options.default_expense
-        tags = []
-        found = False
-        # Try to match entry desc with mappings patterns
-        for m in mappings:
-            pattern = m[0]
-            if isinstance(pattern, str):
-                if entry.desc == pattern:
-                    payee, account, tags = m[1], m[2], m[3]
-                    found = True  # do not break here, later mapping must win
-            else:
-                # If the pattern isn't a string it's a regex
-                match = m[0].match(entry.desc)
-                if match:
-                #if m[0].match(entry.desc):
-                    payee = m[1]
-                    # perform regexp substitution if captures were used
-                    if match.groups():
-                        payee = m[0].sub(m[1],entry.desc)
-                    account, tags = m[2], m[3]
-                    found = True
+        payee_fields = [
+                {"label": "Payee", "default": entry.desc, "possible_values": possible_payees, "remaining": False, "prompt": True},
+                {"label": "Account", "default": options.default_expense, "possible_values": possible_accounts, "remaining": False, "prompt": True},
+                {"label": "Tags", "default": [], "possible_values": possible_tags, "remaining": True, "prompt": options.tags}
+        ]
+        fields = find_mapping(options, entry.desc, options.mapping_files, mappings, payee_fields)
+        return (fields[0], fields[1], fields[2:])
 
-        modified = False
-        if options.quiet and found:
-            pass
-        else:
-            #if options.clear_screen:
-            #    print('\033[2J\033[;H')
-            #print('\n' + entry.prompt())
-            value = prompt_for_value('Payee', possible_payees, payee)
-            if value:
-                modified = modified if modified else value != payee
-                payee = value
-            value = prompt_for_value('Account', possible_accounts, account)
-            if value:
-                modified = modified if modified else value != account
-                account = value
-            if options.tags:
-                value = prompt_for_tags('Tag', possible_tags, tags)
-                if value:
-                    modified = modified if modified else value != tags
-                    tags = value
-
-        if not found or (found and modified):
-            value = 'Y'
-            # if prompt-add-mappings option passed then request confirmation before adding to mapping file
-            if options.prompt_add_mappings:
-                yn_response = prompt_for_value('Append to mapping file?', possible_yesno, 'Y')
-                if yn_response:
-                    value = yn_response
-            if value.upper().strip() not in ('N','NO'):
-                # Add new or changed mapping to mappings and append to file
-                mappings.append((entry.desc, payee, account, tags))
-                append_mapping_file(options.mapping_file,
-                                entry.desc, payee, account, tags)
-
-            # Add new possible_values to possible values lists
-            possible_payees.add(payee)
-            possible_accounts.add(account)
-
-        return (payee, account, tags)
+    def get_field_mapping(entry, name, mapping_file):
+        current_value = str(entry.addons[name])
+        possible_values = [p[1] for p in field_mappings[name]]
+        definition = [
+            {"label": name.title(), "default": current_value, "possible_values": possible_values, "remaining": False, "prompt": True}
+        ]
+        fields = find_mapping(options, current_value, None, field_mappings[name], definition)
+        return fields[0]
 
     def process_input_output(in_file, out_file):
         """ Read CSV lines either from filename or stdin.
@@ -912,12 +1055,34 @@ def main():
         if not options.incremental and out_file is not sys.stdout:
             out_file.truncate(0)
 
+        if options.header_file:
+            template = ""
+            with open(options.header_file, 'r', encoding='utf-8') as f:
+                template = f.read()
+            format_data = {
+                'input_file': in_file.name,
+                'import_date': str(datetime.now()) }
+            header = template.format(**format_data)
+            print(header, sep='\n', file=out_file)
+
         csv_lines = get_csv_lines(in_file)
+        last_entry = {}
         if in_file.name == '<stdin>':
             reset_stdin()
-        for line in  process_csv_lines(csv_lines):
+        for entry, i, payee, account, tags in process_csv_lines(csv_lines):
+            line = entry.journal_entry(i + 1, payee, account, tags)
+            last_entry[entry.subaccount] = entry
             print(line, sep='\n', file=out_file)
             out_file.flush()
+
+        if options.check:
+            for k, e in last_entry.items():
+                if not e.balance:
+                    continue
+                account = e.options.account
+                tmpl = "check account(\"{}\").amount == {} {}"
+                line = tmpl.format(account, e.options.currency, e.balance)
+                print(line, sep='\n', file=out_file)
 
     def get_csv_lines(in_file):
         """
@@ -945,12 +1110,11 @@ def main():
             if len(row) == 0:
                 continue
 
-            entry = Entry(row, csv_lines[i],
-                          options)
+            entry = Entry(row, csv_lines[i], options, sub_options)
 
             # detect duplicate entries in the ledger file and optionally skip or prompt user for action
             #if options.skip_dupes and csv_lines[i].strip() in csv_comments:
-            if (options.skip_older_than < 0) or (entry.days_old <= options.skip_older_than):
+            if (int(options.skip_older_than) < 0) or (entry.days_old <= int(options.skip_older_than)):
                 if options.clear_screen:
                     print('\033[2J\033[;H')
                 print('\n' + entry.prompt())
@@ -962,9 +1126,13 @@ def main():
                         if yn_response:
                             value = yn_response
                     if value.upper().strip() not in ('N','NO'):
+                        print('Skipped')
                         continue
                 while True:
                     payee, account, tags = get_payee_and_account(entry)
+                    for k, v in field_mappings.items():
+                        entry.addons[k] = get_field_mapping(entry, k, v)
+
                     value = 'C'
                     if options.entry_review:
                         # need to display ledger formatted entry here
@@ -987,7 +1155,10 @@ def main():
                 if value.upper().strip() in ('S','SKIP'):
                     continue
 
-                yield entry.journal_entry(i + 1, payee, account, tags)
+                try:
+                    yield entry, i, payee, account, tags
+                except:
+                    continue
 
     try:
         process_input_output(options.infile, options.outfile)
